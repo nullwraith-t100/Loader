@@ -1,0 +1,176 @@
+local CONFIG = {
+    PlaceId     = 142823291,
+    ScriptUrl   = "https://raw.githubusercontent.com/nullwraith-t100/MM2-/refs/heads/main/main",
+    Sha256      = nil, -- optional: lowercase hex hash of the payload. nil = skip check
+    MaxAttempts = 3,
+    BaseDelay   = 2,   -- exponential backoff: 2s, 4s, 8s...
+    MinSize     = 32,  -- bytes; anything smaller is not a real script
+}
+
+local TAG  = "[MM2 Loader]"
+local FLAG = "__MM2_LOADER_RUNNING"
+
+local env = (type(getgenv) == "function" and getgenv()) or _G
+
+--// Logging
+local function log(message)
+    print(TAG, message)
+end
+
+local function warnLog(message)
+    warn(TAG, message)
+end
+
+--// Networking
+local function getRequestFunction()
+    return (syn and syn.request)
+        or http_request
+        or request
+        or (http and http.request)
+end
+
+local function fetch(url)
+    local ok, body = pcall(game.HttpGet, game, url, true)
+    if ok and type(body) == "string" then
+        return body
+    end
+
+    local req = getRequestFunction()
+    if not req then
+        return nil, tostring(body)
+    end
+
+    local reqOk, res = pcall(req, { Url = url, Method = "GET" })
+    if not reqOk then
+        return nil, tostring(res)
+    end
+
+    if type(res) ~= "table" or res.StatusCode ~= 200 or type(res.Body) ~= "string" then
+        return nil, "HTTP " .. tostring(type(res) == "table" and res.StatusCode or "?")
+    end
+
+    return res.Body
+end
+
+--// Validation
+local function sha256(data)
+    local hashFn = crypt and crypt.hash
+    if type(hashFn) ~= "function" then
+        return nil
+    end
+
+    local ok, digest = pcall(hashFn, data, "sha256")
+    return ok and type(digest) == "string" and digest:lower() or nil
+end
+
+local function validate(source)
+    if #source < CONFIG.MinSize then
+        return false, "payload too small"
+    end
+
+    if source:find("^%s*<") or source:find("^%s*404:") then
+        return false, "got an error page instead of Lua"
+    end
+
+    if CONFIG.Sha256 then
+        local digest = sha256(source)
+        if not digest then
+            return false, "hash check requested but no hashing function available"
+        end
+        if digest ~= CONFIG.Sha256:lower() then
+            return false, "hash mismatch"
+        end
+    end
+
+    return true
+end
+
+--// Pipeline
+local function download()
+    local lastError
+
+    for attempt = 1, CONFIG.MaxAttempts do
+        log(("Downloading script (attempt %d/%d)..."):format(attempt, CONFIG.MaxAttempts))
+
+        local body, err = fetch(CONFIG.ScriptUrl)
+
+        if body then
+            local valid, reason = validate(body)
+            if valid then
+                return body
+            end
+            err = reason
+        end
+
+        lastError = err
+        warnLog("Download failed: " .. tostring(err))
+
+        if attempt < CONFIG.MaxAttempts then
+            task.wait(CONFIG.BaseDelay * 2 ^ (attempt - 1))
+        end
+    end
+
+    return nil, lastError
+end
+
+local function execute(source)
+    if type(loadstring) ~= "function" then
+        return false, "loadstring is not available in this environment"
+    end
+
+    local compiled, compileError = loadstring(source, "=MM2")
+    if not compiled then
+        return false, "compilation failed: " .. tostring(compileError)
+    end
+
+    task.spawn(function()
+        local ok, runtimeError = xpcall(compiled, debug.traceback)
+        if not ok then
+            env[FLAG] = nil
+            warnLog("Runtime error:\n" .. tostring(runtimeError))
+        end
+    end)
+
+    return true
+end
+
+local function boot()
+    if game.PlaceId ~= CONFIG.PlaceId then
+        warnLog("Unsupported game. This loader only supports MM2.")
+        return
+    end
+
+    if env[FLAG] then
+        warnLog("Loader is already running.")
+        return
+    end
+
+    env[FLAG] = true
+
+    if not game:IsLoaded() then
+        game.Loaded:Wait()
+    end
+
+    local source, downloadError = download()
+    if not source then
+        env[FLAG] = nil
+        warnLog("Failed to load script: " .. tostring(downloadError))
+        return
+    end
+
+    local ok, executeError = execute(source)
+    if not ok then
+        env[FLAG] = nil
+        warnLog(executeError)
+        return
+    end
+
+    log("Script started.")
+end
+
+--// Entry point
+local ok, err = xpcall(boot, debug.traceback)
+if not ok then
+    env[FLAG] = nil
+    warnLog("Fatal error:\n" .. tostring(err))
+end
